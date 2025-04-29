@@ -1,0 +1,49 @@
+hosts:
+  "root_b":
+    tags: [root]
+    zones: 
+      - com
+      - edu
+    records: []
+    additional_config: []
+  "com":
+    zones: 
+      - google
+    records: []
+    additional_config: []
+  "edu":
+    zones: 
+      - neu
+    records: []
+    additional_config: []
+  "google_com":
+    zones:
+      - sub
+    records: |
+      $TTL 5
+      @	IN	A	1.2.3.4
+      www	IN	CNAME	web
+      web	IN	A	5.6.7.8
+    additional_config: |
+      header {
+        response set ra aa
+        response clear rd
+      }
+  "neu_edu":
+    zones: []
+    records: |
+      $TTL 5
+      @	IN	A	4.3.2.1
+      www	IN	CNAME	web
+      web	IN	A	8.7.6.5
+    additional_config: |
+      erratic {
+        delay 3 5ms
+        truncate 5
+      }
+  "sub_google_com":
+    zones: []
+    records: |
+      $TTL 10
+      @	IN	A	4.4.4.4
+    additional_config: []

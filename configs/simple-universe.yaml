@@ -1,0 +1,124 @@
+hosts:
+  "root_a":
+    tags: [root]
+    zones: 
+      - foo
+      - baz
+      - drop
+      - delay
+      - trunc
+    records: []
+    additional_config: []
+  "foo":
+    tags: []
+    zones: 
+      - bar
+      - bailiwick
+      - cache
+    records: |
+      @ IN MX 20 mail
+      www IN A 89.2.33.1
+      mail IN CNAME server
+      server IN CNAME other
+      other IN A 1.2.3.4
+      txt IN TXT "this is text"
+    additional_config: []
+  "bar_foo":
+    tags: [nodrop, nodelay, notrunc]
+    zones: 
+      - sub
+    records: |
+      @	IN	A	1.2.3.4
+      www	IN	CNAME	web
+      web	IN	A	5.6.7.8
+      link  IN  CNAME www.sub
+      otherlink IN  CNAME server.baz.
+    additional_config: []
+  "sub_bar_foo":
+    tags: []
+    zones: []
+    records: |
+      @	IN	A	1.2.3.4
+      www	IN	CNAME	web
+      web	IN	A	99.88.55.44
+    additional_config: []
+  "bailiwick_foo":
+    tags: [bailiwick]
+    zones: []
+    records: |
+      www	IN	A	10.11.12.13
+      web	IN	A	10.11.12.14
+    additional_config: |
+      template IN ANY bailiwick.foo {
+        match "^www\.bailiwick\.foo\.$"
+        answer "www.bailiwick.bar 60 IN A 1.2.3.4"
+        fallthrough
+      }
+      template IN ANY bailiwick.foo {
+        match "^web\.bailiwick\.foo\.$"
+        additional "www.bailiwick.bar 60 IN A 1.2.3.4"
+        fallthrough
+      }
+  "cache_foo":
+    tags: [cache]
+    zones: []
+    records: |
+      www	IN	TXT	"foo"
+      bar	IN	TXT	"bar"
+      baz	IN	TXT	"baz"
+      blah	IN	TXT	"blah"
+      web	IN	TXT	"web"
+      txt	IN	TXT	"txttext"
+    additional_config: |
+      template IN TXT cache.foo {
+        match "^(?P<a>.+)\.cache\.foo\.$"
+        answer "{{ .Group.a }}.cache.foo 5 IN TXT {{ .Message.Id }}"
+        fallthrough
+      }
+  "drop":
+    tags: []
+    zones:
+      - sub
+    records: []
+    additional_config: []
+  "sub_drop":
+    tags: [drop]
+    zones: []
+    records: |
+      @	IN	A	192.0.2.53
+      web	IN	A	192.0.2.53
+    additional_config: |
+      erratic {
+        drop 2
+      }    
+  "delay":
+    tags: []
+    zones:
+      - test
+    records: []
+    additional_config: []
+  "test_delay":
+    tags: [delay]
+    zones: []
+    records: |
+      www	IN	A	192.0.2.53
+    additional_config: |
+      erratic {
+        delay 2 1000ms
+      }  
+  "trunc":
+    tags: [truncate]
+    zones: []
+    records: |
+      test	IN	A	192.0.2.53
+    additional_config: |
+      erratic {
+        truncate 2
+      }    
+  "baz":
+    tags: [nodrop, nodela, notrunc]
+    zones: []
+    records: |
+      server IN CNAME other
+      other IN A 66.3.9.44
+    additional_config: []

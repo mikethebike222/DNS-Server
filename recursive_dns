@@ -1,0 +1,515 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse, socket, time, json, select, struct, sys, math
+from dnslib import DNSRecord, RR, QTYPE, A, CNAME, MX, TXT, NS
+from dnslib.zoneresolver import ZoneResolver
+
+
+# Server Class where everything runs
+class Server:
+    def __init__(self, root_ip, domain, port):
+        self.root_ip = root_ip
+
+        # The ttl mentioned in the zone file
+        self.origin_ttl = None
+
+        # Cache for storing records
+        # (label, type) -> [(time(cur time + ttl), record)]
+        self.cache = {}
+
+        # Domain we serve
+        self.domain = self.get_zone(domain)
+        
+
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(("0.0.0.0", port))
+        self.port = self.socket.getsockname()[1]
+
+        self.log("Bound to port %d" % self.port)
+
+    # Gets the domain we are serving and updates the initial cache(calls helper)
+    # Params:
+    # domain: the path to open at
+    # return: Returns the domain we serve
+    def get_zone(self, domain):
+
+        # Read the file and make a resolver 
+        with open(domain, 'r') as file:
+            zone = file.read()
+        resolver = ZoneResolver(zone)
+
+        # For loop to find the SOA label and then get the domain and the ttl for every record in the file
+        for label, rtype, recor in resolver.zone:
+            if rtype == "SOA":
+                record = str(recor)
+                new_str = [part for part in record.split(" ") if part]
+
+                # Domain we serve
+                domain = new_str[0]
+                # Origin ttl
+                self.origin_ttl = new_str[1]
+
+        # Intialize the cache using the resolver
+        self.initialize_cache(resolver)
+        return domain
+    
+
+    # Initialize the cache with what we get from the Zone File    
+    # Params:
+    # resolver: Our zone resolver which we want to go through
+    # returns: Nothing, just modifies our self.cache
+    def initialize_cache(self, resolver):
+
+        # Loop through records, if the key doesn't exist make the []
+        # If it does than append to the array with the new record
+        for label, rtype, record in resolver.zone:
+
+            # Key format like this ("example.com."", "A")
+            key = ((str(label), str(rtype)))
+            if key not in self.cache:
+                self.cache[key] = []
+            # append to cache with following(expiry time, record, ttl)
+            self.cache[key].append((time.time() + float(self.origin_ttl), record, int(self.origin_ttl)))
+
+    # Log message in stderr
+    def log(self, message):
+        sys.stderr.write(message + "\n")
+        sys.stderr.flush()
+
+    # Send message to the addr
+    def send(self, addr, message):
+        self.log("Sending message:\n%s" % message)
+        self.socket.sendto(message.pack(), addr)
+
+    # Method that recieves a message from a client and then sends back
+    # The correct response.
+    def recv(self, socket):
+        data, addr = socket.recvfrom(65535)
+
+        # Unpack the DNS request
+        request = DNSRecord.parse(data)
+        self.log("Received message:\n%s" % request)
+
+
+        response = request.reply()
+
+        name = request.q.qname
+        query_type = request.q.qtype
+        type_str = QTYPE.get(query_type)
+
+        # Call craft_responses which will return the correct response to the client
+        response = self.craft_responses(response, name, type_str)
+        
+        # Send the response to the addr
+        self.send(addr, response)
+    
+
+    # Method for crafting responses
+    # Params:
+    # response: The response we want to modify/add too and eventually return
+    # name: The name of the server thats is being queried about
+    # qtype: The type of the original query("A","CNAME", etc).
+    # Returns the updated response
+    def craft_responses(self, response, name, qtype):
+
+        # Refresh the cache each time to get rid of expired records
+        self.refresh_cache()
+
+        # Check if the key(server, type) is not in the cache
+        # If it isn't and it doesn't end with our authoritative domain
+        # Then call the forward_query method to forward to the root
+        if (str(name), qtype) not in self.cache:
+
+            # If it is in our Authoritative domain don't forward to the root
+            if not str(name).endswith(self.domain):
+                new_response = self.forward_query(self.root_ip, name, qtype)
+
+                # Modify headers to the original response
+                new_response.header.id = response.header.id
+                new_response.header.aa = 0
+                new_response.header.ra = 1
+                return new_response
+            
+        # Ifs and elifs for query types to call respective methods for each type
+        if qtype == "A":
+            return self.make_A_response(name, response)
+        elif qtype == "CNAME":
+            return self.make_CNAME_response(name, response)
+        elif qtype == "MX":
+            return self.make_MX_response(name, response)
+        elif qtype == "TXT":
+            return self.make_TXT_response(name, response)
+        elif qtype == "NS":
+            return self.make_NS_response(name, response)
+    
+
+    # Forwards a request to either the root server or a server the root
+    # told us to query to for further answers.
+    # Params: 
+    # ip: The ip address(server) we want to send the query too
+    # name: What we are asking about in our query
+    # qtype: The query type we are asking
+    # returns: It returns the final response after recursion
+    def forward_query(self, ip, name, qtype):
+        # Make the query we are going to send
+        query = DNSRecord.question(str(name), qtype)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.sendto(query.pack(), (ip, 60053))
+        data, _ = sock.recvfrom(65535)
+        response = DNSRecord.parse(data)
+        response.header.tc = 0
+        sock.close()
+
+        # Apply bailiwick checking after getting the domain for the server
+        parts = str(name).split('.')
+        if len(parts) >= 2:
+            query_domain = parts[-2] + '.' + parts[-1]
+        else:
+            query_domain = str(name)
+        response = self.bailiwick_check(response, query_domain)
+
+        # Handle A queries by calling forward_A to find the CNAME
+        if qtype == "A":
+            response = self.forward_A(response)
+        
+        # Cache valid responses by calling cache_response
+        if response.header.rcode == 0:
+            self.cache_response(response)
+
+        # Return or follow the referrals
+        if len(response.rr) > 0:
+            if not str(name).endswith(self.domain):
+                response.header.aa = 0
+            return response
+        
+        # Handle referrals if not done
+        return self.handle_referrals(response, name, qtype)
+        
+    # Handles A record queries where we need to recur on CNAMEs
+    # Params:
+    # response: The current response thats being built
+    # returns: The updated response with all appropriate records
+    def forward_A(self, response):
+        # Handle A queries with CNAME chasing
+        has_cname = False
+        has_a_record = False
+        cname_target = None
+        
+        for record in response.rr:
+            if record.rtype == QTYPE.CNAME:
+                has_cname = True
+                cname_target = str(record.rdata)
+            elif record.rtype == QTYPE.A:
+                has_a_record = True
+        
+        # If we have a CNAME and no A record follow it
+        if has_cname and not has_a_record and cname_target:
+            cname_response = self.forward_query(self.root_ip, cname_target, "A")
+            
+            if cname_response and len(cname_response.rr) > 0:
+                for record in cname_response.rr:
+                    response.add_answer(record)
+        
+        return response
+    
+
+    # Caches records from a response
+    # Params:
+    # response: The response containing records to cache
+    # returns: It doesn't return anything, just updates cache
+    def cache_response(self, response):
+
+        # Cache answer section records
+        for record in response.rr:
+            cache_key = (str(record.rname), QTYPE.get(record.rtype))
+            if cache_key not in self.cache:
+                self.cache[cache_key] = []
+            self.cache[cache_key].append((time.time() + record.ttl, record, record.ttl))
+        
+        # Cache authority section records
+        for auth in response.auth:
+            cache_key = (str(auth.rname), QTYPE.get(auth.rtype))
+            if cache_key not in self.cache:
+                self.cache[cache_key] = []
+            self.cache[cache_key].append((time.time() + auth.ttl, auth, auth.ttl))
+
+        
+        # Cache additional section records
+        for ar in response.ar:
+            cache_key = (str(ar.rname), QTYPE.get(ar.rtype))
+            if cache_key not in self.cache:
+                self.cache[cache_key] = []
+            self.cache[cache_key].append((time.time() + ar.ttl, ar, ar.ttl))
+
+
+
+    # Handles referrals and cases for NS queries
+    # Params:
+    # response: The response containing referrals
+    # name: the domain name being queried
+    # qtype: the query type 
+    # returns: returns the final response after following referrals if needed
+    def handle_referrals(self, response, name, qtype):
+        # For NS queries check if we already have the answer in the authority section
+        if qtype == "NS" and len(response.auth) > 0:
+            ns_records_found = False
+            for auth in response.auth:
+                if auth.rtype == QTYPE.NS and str(auth.rname) == str(name):
+                    # We have our answer in authority so set flag to true
+                    ns_records_found = True
+            
+            if ns_records_found:
+                # Return the response as is
+                if not str(name).endswith(self.domain):
+                    response.header.aa = 0
+                return response
+        
+        # Look for NS records in the authority section
+        if len(response.auth) > 0:
+            for auth in response.auth:
+                if auth.rtype == QTYPE.NS:
+                    ns_name = str(auth.rdata)
+
+                    # Look for ip in the additional section since its an NS record
+                    for ar in response.ar:
+                        if str(ar.rname) == ns_name and ar.rtype == QTYPE.A:
+                            next_server = str(ar.rdata)
+                            # Recursive call to the next server
+                            return self.forward_query(next_server, name, qtype)
+        
+        # Set authority flag to 0 and return
+        if not str(name).endswith(self.domain):
+            response.header.aa = 0
+        return response
+        
+
+    # Filter out responses to only include those withtin the responding servers bailiwick
+    # Params:
+    # response: Response from our previous query
+    # domain: responding servers domain
+    # returns: A response with only records within the responding servers bailiwick
+    def bailiwick_check(self, response, domain):
+        
+        # Make the new response with same header and questions
+        new_response = DNSRecord()
+        new_response.header = response.header
+        new_response.questions = response.questions
+    
+        # Filter answer section to only include records within the bailiwick
+        for record in response.rr:
+            if str(record.rname).endswith(domain):
+                new_response.add_answer(record)
+        
+        # Filter authority section to only include records within the bailiwick
+        for auth in response.auth:
+            if str(auth.rname).endswith(domain):
+                new_response.add_auth(auth)
+        
+        # Filter additional section to only include records within the bailiwick
+        for ar in response.ar:
+            if str(ar.rname).endswith(domain):
+                new_response.add_ar(ar)
+ 
+        return new_response
+
+
+
+    # Crafts a response to a query of type A if we have the response in our
+    # cache or do nxdomain if it's in our domain but we don't have it.
+    # Params:
+    # name: The name of the server we are trying to see if we have
+    # response: The response to modify too
+    # returns: Returns the updated response
+    def make_A_response(self, name, response):
+
+        # Check if the name of the server has an alias to a different server
+        if (str(name), "CNAME") in self.cache:
+
+            # If it does than we add the record as an answer and recur on the alias of that server
+            for ex, record, tt in self.cache[(str(name), "CNAME")]:
+                target = str(record.rdata)
+                cn_data = CNAME(target)
+                response.add_answer(RR(str(name), QTYPE.CNAME, rdata=cn_data, ttl=tt))
+                if target.endswith(str(self.domain)):
+                    # Recur on it if in our domain
+                    response = self.make_A_response(target, response)
+            # Add the authority section
+            
+            if not str(name).endswith(self.domain):
+                response.header.aa = 0
+            return self.add_authority(response)     
+
+        # Elif it has the type A in the cache we want to add the record to our response
+        elif (str(name), "A") in self.cache:
+            for ex, record, tt in self.cache[(str(name), "A")]:
+                ip = str(record.rdata)
+                a_data = A(ip)
+                response.add_answer(RR(str(name), QTYPE.A, rdata=a_data, ttl=tt))  
+            if not str(name).endswith(self.domain):
+                response.header.aa = 0
+            return response
+        
+        # If we get to this we weren't able to satisfy the request so rcode is 3(nxdomain)
+        response.header.rcode = 3
+        return response
+
+
+
+    # Crafts a response to a query of type CNAME if we have the response in our
+    # cache or do nxdomain if it's in our domain but we don't have it.
+    # Params:
+    # name: The name of the server we are trying to see if we have
+    # response: The response to modify too
+    # returns: Returns the updated response
+    def make_CNAME_response(self, name, response):
+
+        # If in our cache we want to add the records we have to the response
+        if (str(name), "CNAME") in self.cache:
+            for ex,record,tt in self.cache[(str(name), "CNAME")]:
+                target = str(record.rdata)
+                cn_data = CNAME(target)
+                response.add_answer(RR(str(name), QTYPE.CNAME, rdata=cn_data, ttl=tt))  
+            if not str(name).endswith(self.domain):
+                # Change flag if we aren't authoritative
+                response.header.aa = 0
+
+            # Return response after adding authorities
+            return self.add_authority(response) 
+        else:
+            # If we get to this we weren't able to satisfy the request so rcode is 3(nxdomain)
+            response.header.rcode = 3
+            return response
+
+    # Crafts a response to a query of type MX if we have the response in our
+    # cache or do nxdomain if it's in our domain but we don't have it.
+    # Params:
+    # name: The name of the server we are trying to see if we have
+    # response: The response to modify too
+    # returns: Returns the updated response
+    def make_MX_response(self, name, response):
+        if (str(name), "MX") in self.cache:
+            if not str(name).endswith(self.domain):
+                response.header.aa = 0
+            for ext, record, tt in self.cache[(str(name), "MX")]:
+                mx_data = str(record.rdata)
+                parts = mx_data.split()
+                priority = int(parts[0])
+                target = str(parts[1])
+
+                mx_record = MX(target, priority)
+                response.add_answer(RR(str(name), QTYPE.MX, rdata=mx_record, ttl=tt))
+        else:
+            # If we get to this we weren't able to satisfy the request so rcode is 3(nxdomain)
+            response.header.rcode = 3
+            return response
+        if not str(name).endswith(self.domain):
+            response.header.aa = 0
+        return self.add_authority(response)
+
+
+    # Crafts a response to a query of type TXT if we have the response in our
+    # cache or do nxdomain if it's in our domain but we don't have it.
+    # Params:
+    # name: The name of the server we are trying to see if we have
+    # response: The response to modify too
+    # returns: Returns the updated response
+    def make_TXT_response(self, name, response):
+        if (str(name), "TXT") in self.cache:
+            if not str(name).endswith(self.domain):
+                response.header.aa = 0
+            for ex, record,tt in self.cache[(str(name), "TXT")]:
+                # Get the text content
+                txt_content = str(record.rdata).strip('"') 
+                txt_record = TXT(txt_content)
+                response.add_answer(RR(str(name), QTYPE.TXT, rdata=txt_record, ttl=tt))
+        else:
+            response.header.rcode = 3
+            return response
+        
+        if not str(name).endswith(self.domain):
+            response.header.aa = 0
+        return self.add_authority(response)
+    
+    
+
+    # Crafts a response to a query of type NS if we have the response in our
+    # cache or do nxdomain if it's in our domain but we don't have it.
+    # Params:
+    # name: The name of the server we are trying to see if we have
+    # response: The response to modify too
+    # returns: Returns the updated response
+    def make_NS_response(self, name, response):
+        if (str(name), "NS") in self.cache:
+            if not str(name).endswith(self.domain):
+                response.header.aa = 0
+                
+            for ex, record, tt in self.cache[(str(name), "NS")]:
+                ns_name = str(record.rdata)
+                ns_record = NS(ns_name)
+                
+                # Check if this is our domain or not
+                if str(name).endswith(self.domain):
+                    # For our domain, add NS to answer section
+                    response.add_answer(RR(str(name), QTYPE.NS, rdata=ns_record, ttl=tt))
+                else:
+                    # For delegations or external domains, add NS to authority section
+                    response.add_auth(RR(str(name), QTYPE.NS, rdata=ns_record, ttl=tt))
+                
+                # Add the A records in either case
+                if (ns_name, "A") in self.cache:
+                    for ext, records, timetl in self.cache[(ns_name, "A")]:
+                        ip = str(records.rdata)
+                        a_record = A(ip)
+                        response.add_ar(RR(ns_name, QTYPE.A, rdata=a_record, ttl=timetl))
+            
+            return response
+        
+        # If we get to this we weren't able to satisfy the request so rcode is 3(nxdomain)
+        response.header.rcode = 3
+        return response
+
+
+    # Adds to the authroity section of a response and then returns the updated response
+    # Params: 
+    # response: response to be updated too
+    # returns: Returns the updated response
+    def add_authority(self, response):
+        if (str(self.domain), "NS") in self.cache:
+            for ex, record,tt in self.cache[(str(self.domain), "NS")]:
+                ns_name = str(record.rdata)
+                ns_record = NS(ns_name)
+                response.add_auth(RR(str(self.domain), QTYPE.NS, rdata=ns_record, ttl=tt))
+        return response
+    
+
+    # Method to refresh the cache 
+    # Removes records that have been stored longer than TTL
+    def refresh_cache(self):
+        current_time = time.time()
+        
+        for key in list(self.cache.keys()):
+            # Filter out expired entries
+            self.cache[key] = [entry for entry in self.cache[key] if entry[0] > current_time]
+            
+            # Remove empty entries
+            if not self.cache[key]:
+                del self.cache[key]
+
+    # Main method for running our DNS server implementation
+    # Just calls recv which handles communication and refreshes cache
+    def run(self):
+        while True:
+            socks = select.select([self.socket], [], [], 0.01)[0]
+            self.refresh_cache()
+            for conn in socks:
+                self.recv(conn)
+        return
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='send data')
+    parser.add_argument('root_ip', type=str, help="The IP address of the root server")
+    parser.add_argument('zone', type=str, help="The zone file for this server")
+    parser.add_argument('--port', type=int, help="The port this server should bind to", default=0)
+    args = parser.parse_args()
+    sender = Server(args.root_ip, args.zone, args.port)
+    sender.run()

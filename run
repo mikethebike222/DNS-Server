@@ -1,0 +1,561 @@
+#!/usr/bin/env python3 
+
+import atexit
+import re
+import sys
+import os
+import time
+import json
+import random
+import select
+import binascii
+import signal
+import traceback
+import socket
+import subprocess
+import yaml
+import struct
+from dnslib import *
+from threading import Thread
+from functools import reduce
+from collections import defaultdict
+
+#### PARAMETERS
+
+EXECUTABLE_NAME = "recursive_dns"
+LOG_LEVEL = 1
+GRACE_PERIOD = 5
+
+ROOT_SERVER_IP = None
+REFERENCE_SERVER_IP = None
+REFERENCE_SERVER_PORT = None
+
+CACHE_TIME = 5 + 2
+DROP_TIME = 6 + 2
+
+#### CODE
+
+simulator = None
+
+def die(msg):
+  print("\nError: %s" % msg)
+  if simulator:
+    simulator.stop()
+  sys.exit(0)
+
+start = time.time()
+
+def now():
+  return time.time() - start
+
+def log(caller, msg, level=0):
+  if level <= LOG_LEVEL:
+    for line in msg.split("\n"):
+      print("[%07.4f  %14s]: %s" % (now(), caller, line))
+
+
+def get_config(config_file):
+  # Load config file
+  if not os.path.exists(config_file):
+    die("Could not find config file '%s'" % config_file)
+
+  try:
+    with open(config_file) as f:
+      config_data = f.read()
+  except Exception as e:
+    die("Unable to read data from config file '%s': %s" % (config_file, e))
+
+  try:
+    config = json.loads(config_data)
+  except Exception as e:
+    die("Unable to parse JSON in config file '%s': %s" % (config_file, e))
+
+  return config
+
+def get_executable(executable):
+  if not os.path.exists(executable):
+    die("Could not find program '%s'" % executable)
+
+  if not os.access(executable, os.X_OK):
+    die("Could not execute program '%s'" % executable)
+
+#### WRAPPER CODE
+
+class FDWrapper:
+  def __init__(self, fd, parent):
+    self.fd = fd
+    self.parent = parent
+
+  def fileno(self):
+    return self.fd.fileno()
+
+class Wrapper:
+  def __init__(self, executable, simulator):
+    self.executable = executable
+    self.simulator = simulator
+
+    self.started = False
+    self.port = None
+
+    self.process = None
+
+  def __str__(self):
+    return self.executable
+
+  def is_started(self):
+    return self.process is not None
+
+  def get_args(self):
+    raise ValueError("Must be implemented by subclass")
+
+  def start(self):
+    args = "%s %s" % (os.path.join(".", self.executable), " ".join(self.get_args()))
+    log("Simulator", "Starting %s with command '%s'" % (self.executable, args))
+    self.process = subprocess.Popen(args,
+                                    shell=True,
+                                    stdin=subprocess.PIPE,
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE,
+                                    preexec_fn=os.setsid)
+
+    def make_non_blocking(fd):
+      try:
+        from fcntl import fcntl, F_GETFL, F_SETFL
+        flags = fcntl(fd, F_GETFL) # get current p.stdout flags
+        fcntl(fd, F_SETFL, flags | os.O_NONBLOCK)
+      except ImportError:
+        print("Warning:  Unable to load fcntl module; things may not work as expected.")
+
+    make_non_blocking(self.process.stdout)
+    make_non_blocking(self.process.stderr)
+
+    atexit.register(self.stop)
+    self.started = True
+
+  def ready(self):
+    return self.port != None
+
+  def stop(self):
+    if self.process and self.process.poll() is None:
+      os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
+    self.process = None
+
+  def get_read_fds(self):
+    if self.process:
+      return [FDWrapper(self.process.stdout, self), FDWrapper(self.process.stderr, self)]
+    else:
+      return []
+
+  def read(self, fd):
+    data = fd.fd.read(100000)
+
+    if len(data) == 0:
+      die("%s exited unexpectedly; it should never exit" % self.executable)
+      
+    if self.process.returncode is not None:
+      die("%s crashed; exiting" % self.executable)
+
+    for line in data.decode('utf-8').strip().split("\n"):
+      log(self.executable, line)
+      m = re.match(r'Bound to port ([0-9]+)', line)
+      if m:
+        self.port = int(m.group(1))
+        log("Simulator", "Found executable bound to port %s" % self.port)
+
+class Executable(Wrapper):
+  def __init__(self, simulator, root_ip, zone):
+    super().__init__(EXECUTABLE_NAME, simulator)
+    self.zone = zone
+    self.root_ip = root_ip
+    self.thread = None
+
+  def get_args(self):
+    return [self.root_ip, self.zone]
+
+  def start(self):
+    super().start()
+    def go():
+      log("Simulator", "Pipe to %s broken" % self.executable)
+      pass
+
+    self.thread = Thread(target=go)
+    self.thread.start() 
+
+  def stop(self):
+    super().stop()
+    self.thread.join()
+
+#### CLIENTS
+
+class Request:
+  def __init__(self, client, id, time, level, authoritative, universe, tags):
+    self.client = client
+    self.id = id
+    self.universe = universe
+    self.authoritative = authoritative
+    self.tags = tags
+    self.level = level
+
+    self.send_time = time
+
+    self.select_lookup(level, tags)
+    self.make_request()
+    self.sent_time = None
+
+    self.response_reference = None
+    self.response_executable = None
+    self.received_time = None
+
+    self.log("Created request %d to go off at %s" % (self.id, self.send_time))
+
+  def clone(self, id, time):
+    req = Request(self.client, id, time, self.level, self.authoritative, self.universe, self.tags)
+    req.request_label = self.request_label
+    req.request_type = self.request_type
+    req.make_request()
+    req.request.header.id = id
+
+    return req
+
+  def select_lookup(self, level, tags):
+    if level < 10:
+      query = self.authoritative.get_query(random.choice(tags))
+    else:
+      query = self.universe.get_query(random.choice(tags))
+    self.request_label = query.rname
+    self.request_type = query.rtype
+
+  def log(self, msg):
+    log("Request %d" % self.id, msg)
+
+  def make_request(self):
+    self.request = DNSRecord(q=DNSQuestion(self.request_label, self.request_type if self.request_type!=QTYPE.CNAME else QTYPE.A))
+    self.request.header.id = self.id 
+
+  def wake(self):
+    if now() > self.send_time and self.sent_time is None:
+      self.sent_time = now()
+      self.client.send(self.request)
+
+  def received_response(self, response, reference=False):
+    if not reference:
+      if self.response_executable != None:
+        self.log("Received duplicate response with id %d; ignoring" % self.id)
+        return
+
+      self.received_time = now()
+      self.response_executable = response
+    else:
+      if self.response_reference != None:
+        self.log("Received duplicate reference response with id %d; ignoring" % self.id)
+        return
+
+      self.response_reference = response
+
+  def check_response(self, all_responses):
+    if not self.response_executable:
+      self.log("Never received response for request %d" % self.id)
+      return False
+
+    if not self.response_reference:
+      self.log("Never received reference response for request %d" % self.id)
+      return False
+    
+    if any(map(lambda t: "cache" in t, self.tags)):
+      if len(all_responses) != 3:
+        self.log("Received unexpected number of responses to cache test: %d" % len(all_responses))
+        return False
+      
+      if (all_responses[0].response_executable.get_a().rtype!=QTYPE.TXT) or (all_responses[1].response_executable.get_a().rtype!=QTYPE.TXT) or (all_responses[0].response_executable.get_a().rdata != all_responses[1].response_executable.get_a().rdata):
+        self.log("Detecting non-caching of first query pair.  Response 1:\n%s\n\nResponse 2:\n%s\n" % (all_responses[0].response_executable, all_responses[1].response_executable))
+        return False
+            
+      if (all_responses[0].response_executable.get_a().rtype!=QTYPE.TXT) or (all_responses[2].response_executable.get_a().rtype!=QTYPE.TXT) or (all_responses[0].response_executable.get_a().rdata == all_responses[2].response_executable.get_a().rdata):
+        self.log("Detecting unallowed caching of response.  Response 1:\n%s\n\nResponse 3:\n%s\n" % (all_responses[0].response_executable, all_responses[2].response_executable))
+        return False
+      
+      return True
+
+    def merge_answer_authority(resp):
+      return DNSRecord(header=resp.header,questions=resp.questions, rr=resp.rr+resp.auth,ar=resp.ar)
+
+    def drop_authority(resp):
+      return DNSRecord(header=resp.header,questions=resp.questions, rr=resp.rr,ar=resp.ar)
+
+    if self.request.get_q().qtype==QTYPE.NS:
+      if merge_answer_authority(self.response_executable) != merge_answer_authority(self.response_reference):
+        self.log("Mismatched response relative to reference: Expected:\n%s\n\nReceived:\n%s\n" % (self.response_reference, self.response_executable))
+        return False
+    else:
+      if drop_authority(self.response_executable) != drop_authority(self.response_reference):
+        self.log("Mismatched response relative to reference: Expected:\n%s\n\nReceived:\n%s\n" % (self.response_reference, self.response_executable))
+        return False
+
+    return True
+
+class Client:
+  def __init__(self, id, executable, lifetime, config, authoritative, universe):
+    self.id = id
+    self.executable = executable
+    self.lifetime = lifetime
+    self.authoritative = authoritative
+    self.universe = universe
+    self.config = config
+    self.level = config["level"]
+
+    self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    self.socket.bind(("0.0.0.0", 0))
+    self.ip = self.socket.getsockname()[0]
+    self.port = self.socket.getsockname()[1]
+
+    self.wrapper = FDWrapper(self.socket, self)  
+
+    self.requests = self.generate_requests()
+
+    self.log("Bound to IP %s port %d" % (self.ip, self.port))
+
+  def generate_request(self, id, time):
+    request = Request(self, id, time, self.level, self.authoritative, self.universe, self.config["tags"])
+    return (id, request)
+
+  def generate_requests(self):
+    num = self.config["requests"]
+
+    ids = random.sample(range(0, 65536), 3*num)
+    times = [random.random() * self.lifetime for i in range(2*num)]
+
+    requests = [self.generate_request(ids[i], times[i]) for i in range(num)]
+
+    # If it's a caching test, add secondary requests after cache expiration
+    if self.config['cache']:
+      # Add the second request that's supposed to be cached
+      requests += [(ids[num+i], requests[i][1].clone(ids[num+i], times[num+i])) for i in range(num)]
+
+      # Add the third request that's supposed to not be cached
+      requests += [(ids[2*num+i], requests[i][1].clone(ids[2*num+i], requests[i][1].send_time + CACHE_TIME)) for i in range(num)]
+
+    return dict(requests)
+
+  def log(self, msg):
+    log("Client %d" % self.id, msg)
+
+  def get_socket(self):
+    return self.wrapper
+
+  def wake(self):
+    for request in self.requests.values():
+      request.wake()
+
+  def send(self, request):
+    self.log("Sending request to 127.0.0.1:\n %s" % (request, ))
+    self.socket.sendto(request.pack(), ("127.0.0.1", self.executable.port))
+
+#    self.log("Sending reference request to %s:\n %s" % (REFERENCE_SERVER_IP, request))
+    self.socket.sendto(request.pack(), (REFERENCE_SERVER_IP, REFERENCE_SERVER_PORT))
+
+  def read(self, socket):
+    data, addr = self.socket.recvfrom(65535)
+    response = DNSRecord.parse(data)
+    if addr != (REFERENCE_SERVER_IP, REFERENCE_SERVER_PORT):
+      self.log("Got response from %s:\n%s" % (addr, response))
+
+    if not response.header.id in self.requests.keys():
+      self.log("Received unexpected response with id %d; ignoring" % response.header.id)
+      return
+
+    self.requests[response.header.id].received_response(response, reference=(addr == (REFERENCE_SERVER_IP, REFERENCE_SERVER_PORT)))
+
+  def check_responses(self):
+    failed = 0
+    for id in self.requests.keys():
+      failed += 0 if self.requests[id].check_response(list(self.requests.values())) else 1
+
+    if failed ==0:
+      self.log("All responses correctly verified")
+    else:
+      self.log("Found %d failed responses out of %d" % (failed, len(self.requests.keys())))
+
+    return failed == 0
+
+#### SIMULATOR
+
+class Simulator:
+  def __init__(self, config, authoritative, universe):
+    self.config = config
+    self.authoritative = authoritative
+    self.universe = universe
+    self.executable = Executable(self, ROOT_SERVER_IP, config["zone"])
+    self.lifetime = config["lifetime"]
+
+    self.clients = [Client(i, self.executable, self.lifetime, config, authoritative, universe) for i in range(config["clients"])]
+
+  def start(self):
+    self.log("Beginning simulation")
+    self.executable.start()
+
+    while True:
+      read_fds = self.executable.get_read_fds()
+      client_fds = list(map(lambda c: c.get_socket(), self.clients))
+
+      sleep_time = 0.1
+      readable, _, _ = select.select(read_fds + client_fds, [], [], sleep_time)
+      start = time.time()
+
+      for r in readable:
+        r.parent.read(r)
+
+      if not self.executable.ready():
+        log("Simulator", "Sleeping for 100ms to let server come up")
+      else:
+        for client in self.clients:
+          client.wake()
+
+      if now() > self.config["lifetime"] + GRACE_PERIOD:
+        self.log("Simulation completed")
+        self.check_final()
+
+  def stop(self):
+    self.executable.stop()
+
+  def log(self, msg):
+    log("Simulator", msg)
+
+  def check_final(self):
+    self.log("Verifying responses...")
+    all_verified = True
+    for client in self.clients:
+      all_verified &= client.check_responses()
+
+    if all_verified:
+      self.log("All simulation responses verified")
+    else:
+      self.log("At least one response incorrect")
+
+    sys.exit(0)
+
+#### UNIVERSE
+
+class Authoritative:
+  def __init__(self, zone_data):
+    self.records = []
+    self.data = zone_data
+    self.parse_zone()
+
+  def parse_zone(self):
+    self.records = RR.fromZone(self.data)
+
+    for record in self.records:
+      record.tags = ["type-%s" % record.rtype]
+
+  def get_query(self, tags):
+    nxdomain = ("nxdomain" in tags)
+    tags = list(filter(lambda t: t != "nxdomain", tags))
+
+    choice = random.choice(list(filter(lambda r: all(map(lambda t: t in r.tags, tags)), self.records)))
+    if nxdomain:
+      return RR(DNSLabel("nxdomain-%s" % choice.rname), choice.rtype, choice.rclass, choice.ttl, choice.rdata)
+    return choice
+
+class Universe:
+  def __init__(self, yaml):
+    self.yaml = yaml
+    self.records = []
+    self.interpret_yaml()
+
+  def interpret_yaml(self):
+    roots = list(filter(lambda s: "tags" in self.yaml['hosts'][s] and "root" in self.yaml['hosts'][s]['tags'], self.yaml['hosts'].keys()))
+    if len(roots) != 1:
+      raise ValueError("Found incorrect number of roots (%d) in universe file" % len(roots))
+
+    # Add a record for the root
+    record = RR(DNSLabel("."), QTYPE.NS, CLASS.IN, 0, A("0.0.0.0"))
+    record.tags = ["type-%s" % QTYPE.A, "level-0"]
+    self.records.append(record)
+
+    self.walk_tree(roots[0], [], root=True)
+
+  def walk_tree(self, key, tags, level=0, root=False):
+    label = "." if root else key.replace("_", ".")
+
+    entry = self.yaml['hosts'][key]
+    tags = tags + (entry['tags'] if 'tags' in entry else [])
+
+    if entry['records']:
+      zone_file = "$ORIGIN %s\n%s" % (label, entry['records'])
+      records = RR.fromZone(zone_file)
+      for r in records:
+        r.tags = tags.copy()
+        r.tags.append("type-%s" % r.rtype)
+        r.tags.append("level-%d" % level)
+      self.records += records
+
+    if entry['zones']:
+      for z in entry['zones']:
+        # Add entries for the NS records that are automatically created
+        record = RR(DNSLabel("%s.%s" % (z, label) if label != "." else "%s." % z), QTYPE.NS, CLASS.IN, 0, A("0.0.0.0"))
+        record.tags = ["type-%s" % QTYPE.NS, "level-%d" % (level+1)]
+        self.records.append(record)
+
+    for zone in entry['zones']:
+      zone_key = zone if root else "%s_%s" % (zone, key)
+      self.walk_tree(zone_key, tags, level=level+1)
+
+  def get_query(self, tags):
+    return random.choice(list(filter(lambda r: all(map(lambda t: t in r.tags, tags)), self.records)))
+
+#### MAIN PROGRAM
+
+def get_address(name):
+  return socket.gethostbyname(name)
+
+def get_addresses(config):
+  global ROOT_SERVER_IP, REFERENCE_SERVER_IP, REFERENCE_SERVER_PORT
+  ROOT_SERVER_IP = get_address(config["root"])
+  log("Setup", "Using IP %s as the root" % ROOT_SERVER_IP)
+  REFERENCE_SERVER_IP, REFERENCE_SERVER_PORT = config["reference"].split(":")
+  REFERENCE_SERVER_IP = get_address(REFERENCE_SERVER_IP)
+  REFERENCE_SERVER_PORT = int(REFERENCE_SERVER_PORT)
+  log("Setup", "Using %s:%d as the reference server" % (REFERENCE_SERVER_IP, REFERENCE_SERVER_PORT))
+
+def get_authoritative(config):
+  with open(config["simulator"]["zone"], 'r') as f:
+      return Authoritative(f.read())
+
+def get_universe(config):
+  with open(config["universe"], 'r') as f:
+      return Universe(yaml.load(f, Loader=yaml.SafeLoader))
+
+if len(sys.argv) != 2:
+  die("Usage: ./run config-file")
+
+get_executable(EXECUTABLE_NAME)
+config = get_config(sys.argv[1])
+config['simulator']['cache'] = any(map(lambda t: "cache" in t, config["simulator"]["tags"]))
+config['simulator']['drop'] = any(map(lambda t: "drop" in t, config["simulator"]["tags"]))
+
+if "seed" in config:
+  random.seed(config["seed"])
+
+# Look up the root and reference server addresses
+get_addresses(config)
+
+# Read the local zone file
+authoritative = get_authoritative(config)
+
+# Interpret the universe
+universe = get_universe(config)
+
+# Set up the DNS infrastructure
+simulator = Simulator(config["simulator"], authoritative, universe)
+
+# Adjust grace period if we're doing a caching test
+GRACE_PERIOD = CACHE_TIME + GRACE_PERIOD if config['simulator']['cache'] else GRACE_PERIOD
+GRACE_PERIOD = DROP_TIME + GRACE_PERIOD if config['simulator']['drop'] else GRACE_PERIOD
+
+try:
+  simulator.start()
+except Exception as e:
+  traceback.print_exc()
+  die("Got exception %s" % e)
+except KeyboardInterrupt:
+  die("Received keyboard interrupt")

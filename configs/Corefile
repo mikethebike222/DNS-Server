@@ -1,0 +1,9 @@
+.:60053 {
+        bind lo0
+        file example.com.zone example.com
+	template IN TXT cache.foo {
+          match "^(?P<a>.+)\.cache\.foo\.$"
+          answer "{{ .Group.a }}.cache.foo 5 IN TXT {{ .Message.Id }}"
+          fallthrough
+      }
+}
