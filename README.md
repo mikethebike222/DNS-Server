@@ -58,7 +58,7 @@ json{
     "level": 1,      
     "zone": "path/to/zone/file",    
     "tags": ["type-A"]    
-  }     
+  }        
 }     
 
 Implementation Details -      
